@@ -1,39 +1,30 @@
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use crate::{Packet, Protocol, Responder};
+use futures::StreamExt;
+use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::net::SocketAddr;
-use std::collections::HashMap;
-use crate::{Packet, Protocol, Responder};
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
-use futures::{StreamExt};
-
-#[derive(Clone, Debug)]
-pub struct BroadcastMessage {
-    pub data: Vec<u8>,
-}
 
 #[derive(Clone)]
 pub struct ConnectionManager {
-    broadcast_tx: broadcast::Sender<BroadcastMessage>,
-    connections: Arc<RwLock<HashMap<SocketAddr, broadcast::Receiver<BroadcastMessage>>>>,
+    connections: Arc<RwLock<HashMap<SocketAddr, Responder>>>,
 }
 
 impl ConnectionManager {
-    pub fn new(capacity: usize) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(capacity);
+    pub fn new() -> Self {
         Self {
-            broadcast_tx,
             connections: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub async fn register(&self, addr: SocketAddr) {
-        let rx = self.broadcast_tx.subscribe();
+    pub async fn register(&self, addr: SocketAddr, responder: Responder) {
         let mut conns = self.connections.write().await;
-        conns.insert(addr, rx);
+        conns.insert(addr, responder);
     }
 
     pub async fn unregister(&self, addr: SocketAddr) {
@@ -41,17 +32,21 @@ impl ConnectionManager {
         conns.remove(&addr);
     }
 
-    pub async fn send_to(&self, _addr: SocketAddr, data: Vec<u8>) -> Result<(), String> {
-        let _ = self.broadcast_tx.send(BroadcastMessage { data });
-        Ok(())
+    pub async fn send_to(&self, addr: SocketAddr, data: &[u8]) -> Result<(), String> {
+        let conns = self.connections.read().await;
+        if let Some(responder) = conns.get(&addr) {
+            responder.send(data).await;
+            Ok(())
+        } else {
+            Err("Client not found".to_string())
+        }
     }
 
-    pub fn broadcast(&self, data: Vec<u8>) {
-        let _ = self.broadcast_tx.send(BroadcastMessage { data });
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<BroadcastMessage> {
-        self.broadcast_tx.subscribe()
+    pub async fn broadcast(&self, data: &[u8]) {
+        let conns = self.connections.read().await;
+        for responder in conns.values() {
+            responder.send(data).await;
+        }
     }
 
     pub async fn connection_count(&self) -> usize {
@@ -59,17 +54,11 @@ impl ConnectionManager {
     }
 }
 
-type PacketHandler = Arc<
-    dyn Fn(Packet, SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
+type PacketHandler =
+    Arc<dyn Fn(Packet, SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-type ConnectionValidator = Arc<
-    dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = bool> + Send>>
-        + Send
-        + Sync,
->;
+type ConnectionValidator =
+    Arc<dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
 pub struct Server {
     pub listeners: Vec<(String, Protocol)>,
@@ -84,7 +73,7 @@ impl Server {
             listeners: Vec::new(),
             on_packet: None,
             on_connect: None,
-            connection_manager: ConnectionManager::new(1000),
+            connection_manager: ConnectionManager::new(),
         }
     }
 
@@ -98,9 +87,7 @@ impl Server {
         F: Fn(Packet, SocketAddr) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_packet = Some(Arc::new(move |packet, addr| {
-            Box::pin(func(packet, addr))
-        }));
+        self.on_packet = Some(Arc::new(move |packet, addr| Box::pin(func(packet, addr))));
         self
     }
 
@@ -109,9 +96,7 @@ impl Server {
         F: Fn(SocketAddr) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
-        self.on_connect = Some(Arc::new(move |addr| {
-            Box::pin(func(addr))
-        }));
+        self.on_connect = Some(Arc::new(move |addr| Box::pin(func(addr))));
         self
     }
 
@@ -123,13 +108,23 @@ impl Server {
         for (addr, protocol) in self.listeners {
             match protocol {
                 Protocol::Tcp => {
-                    Self::spawn_tcp_listener(addr, on_packet.clone(), on_connect.clone(), manager.clone());
+                    Self::spawn_tcp_listener(
+                        addr,
+                        on_packet.clone(),
+                        on_connect.clone(),
+                        manager.clone(),
+                    );
                 }
                 Protocol::Udp => {
                     Self::spawn_udp_listener(addr, on_packet.clone());
                 }
                 Protocol::WebSocket => {
-                    Self::spawn_websocket_listener(addr, on_packet.clone(), on_connect.clone(), manager.clone());
+                    Self::spawn_websocket_listener(
+                        addr,
+                        on_packet.clone(),
+                        on_connect.clone(),
+                        manager.clone(),
+                    );
                 }
             }
         }
@@ -160,8 +155,12 @@ impl Server {
                 let stream = Arc::new(Mutex::new(stream));
                 let manager = manager.clone();
 
+                // Register TCP connection correctly
+                manager
+                    .register(client_addr, Responder::Tcp(stream.clone()))
+                    .await;
+
                 tokio::spawn(async move {
-                    manager.register(client_addr).await;
                     Self::handle_tcp_connection(stream, client_addr, handler, manager).await;
                 });
             }
@@ -244,10 +243,13 @@ impl Server {
                         Err(_) => return,
                     };
 
-                    manager.register(client_addr).await;
-
                     let (write, mut read) = ws_stream.split();
                     let writer = Arc::new(Mutex::new(write));
+
+                    // Register WebSocket connection
+                    manager
+                        .register(client_addr, Responder::WebSocket(writer.clone()))
+                        .await;
 
                     while let Some(msg) = read.next().await {
                         let msg = match msg {

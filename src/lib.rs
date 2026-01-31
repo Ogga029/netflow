@@ -46,7 +46,7 @@ impl Packet {
     }
 }
 
-pub(crate) enum Responder {
+pub enum Responder {
     Tcp(Arc<Mutex<TcpStream>>),
     Udp(Arc<UdpSocket>, SocketAddr),
     WebSocket(

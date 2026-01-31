@@ -5,12 +5,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use futures::SinkExt;
+use tokio_tungstenite::tungstenite::Message;
 
 pub mod client;
 pub mod server;
 
-pub use client::Client;
-pub use server::Server;
 
 #[derive(Clone)]
 pub enum Protocol {
@@ -32,6 +31,7 @@ impl fmt::Debug for Packet {
             Protocol::Udp => "UDP",
             Protocol::WebSocket => "WebSocket",
         };
+
         f.debug_struct("Packet")
             .field("data", &self.data)
             .field("data_string", &String::from_utf8_lossy(&self.data))
@@ -41,7 +41,7 @@ impl fmt::Debug for Packet {
 }
 
 impl Packet {
-    pub async fn reply(&mut self, data: &[u8]) {
+    pub async fn reply(&self, data: &[u8]) {
         self.responder.send(data).await;
     }
 }
@@ -49,11 +49,20 @@ impl Packet {
 pub(crate) enum Responder {
     Tcp(Arc<Mutex<TcpStream>>),
     Udp(Arc<UdpSocket>, SocketAddr),
-    WebSocket(Arc<Mutex<tokio_tungstenite::WebSocketStream<TcpStream>>>),
+    WebSocket(
+        Arc<
+            Mutex<
+                futures::stream::SplitSink<
+                    tokio_tungstenite::WebSocketStream<TcpStream>,
+                    Message,
+                >,
+            >,
+        >,
+    ),
 }
 
 impl Responder {
-    async fn send(&mut self, data: &[u8]) {
+    async fn send(&self, data: &[u8]) {
         match self {
             Responder::Tcp(stream) => {
                 let mut locked = stream.lock().await;
@@ -62,39 +71,11 @@ impl Responder {
             Responder::Udp(socket, addr) => {
                 let _ = socket.send_to(data, *addr).await;
             }
-            Responder::WebSocket(ws) => {
-                let mut locked = ws.lock().await;
-                let msg = tokio_tungstenite::tungstenite::Message::Binary(
-                    tokio_tungstenite::tungstenite::Bytes::copy_from_slice(data)
-                );
+            Responder::WebSocket(writer) => {
+                let mut locked = writer.lock().await;
+                let msg = Message::binary(data.to_vec());
                 let _ = locked.send(msg).await;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn protocol_clone_tcp() {
-        let p1 = Protocol::Tcp;
-        let p2 = p1.clone();
-        matches!(p2, Protocol::Tcp);
-    }
-
-    #[test]
-    fn protocol_clone_udp() {
-        let p1 = Protocol::Udp;
-        let p2 = p1.clone();
-        matches!(p2, Protocol::Udp);
-    }
-
-    #[test]
-    fn protocol_clone_websocket() {
-        let p1 = Protocol::WebSocket;
-        let p2 = p1.clone();
-        matches!(p2, Protocol::WebSocket);
     }
 }

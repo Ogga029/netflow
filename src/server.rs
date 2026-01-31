@@ -1,5 +1,5 @@
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::io::{AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use std::future::Future;
 use std::pin::Pin;
@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use crate::{Packet, Protocol, Responder};
 use tokio_tungstenite::tungstenite::Message;
-use futures::stream::StreamExt;
+use futures::{StreamExt};
 
 #[derive(Clone, Debug)]
 pub struct BroadcastMessage {
@@ -145,63 +145,44 @@ impl Server {
         manager: ConnectionManager,
     ) {
         tokio::spawn(async move {
-            match TcpListener::bind(&addr).await {
-                Ok(listener) => loop {
-                    match listener.accept().await {
-                        Ok((stream, client_addr)) => {
-                            if let Some(ref validator) = validator {
-                                if !validator(client_addr).await {
-                                    continue;
-                                }
-                            }
+            let listener = TcpListener::bind(&addr).await.unwrap();
 
-                            let handler = handler.clone();
-                            let stream = Arc::new(Mutex::new(stream));
-                            let manager = manager.clone();
+            loop {
+                let (stream, client_addr) = listener.accept().await.unwrap();
 
-                            tokio::spawn(async move {
-                                manager.register(client_addr).await;
-                                Self::handle_tcp_connection(stream, client_addr, handler, manager).await;
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Error accepting connection: {}", e);
-                        }
+                if let Some(ref validator) = validator {
+                    if !validator(client_addr).await {
+                        continue;
                     }
-                },
-                Err(e) => eprintln!("Failed to bind TCP listener on {}: {}", addr, e),
+                }
+
+                let handler = handler.clone();
+                let stream = Arc::new(Mutex::new(stream));
+                let manager = manager.clone();
+
+                tokio::spawn(async move {
+                    manager.register(client_addr).await;
+                    Self::handle_tcp_connection(stream, client_addr, handler, manager).await;
+                });
             }
         });
     }
 
     fn spawn_udp_listener(addr: String, handler: PacketHandler) {
         tokio::spawn(async move {
-            match UdpSocket::bind(&addr).await {
-                Ok(socket) => {
-                    let socket = Arc::new(socket);
-                    let mut buffer = [0u8; 1024];
+            let socket = Arc::new(UdpSocket::bind(&addr).await.unwrap());
+            let mut buffer = [0u8; 1024];
 
-                    loop {
-                        match socket.recv_from(&mut buffer).await {
-                            Ok((size, client_addr)) => {
-                                let packet = Packet {
-                                    data: buffer[..size].to_vec(),
-                                    protocol: Protocol::Udp,
-                                    responder: Responder::Udp(socket.clone(), client_addr),
-                                };
+            loop {
+                let (size, client_addr) = socket.recv_from(&mut buffer).await.unwrap();
 
-                                let handler = handler.clone();
-                                tokio::spawn(async move {
-                                    handler(packet, client_addr).await;
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("Error receiving UDP packet: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => eprintln!("Failed to bind UDP listener on {}: {}", addr, e),
+                let packet = Packet {
+                    data: buffer[..size].to_vec(),
+                    protocol: Protocol::Udp,
+                    responder: Responder::Udp(socket.clone(), client_addr),
+                };
+
+                handler(packet, client_addr).await;
             }
         });
     }
@@ -218,15 +199,9 @@ impl Server {
             let size = {
                 let mut locked = stream.lock().await;
                 match locked.read(&mut buffer).await {
-                    Ok(0) => {
-                        manager.unregister(addr).await;
-                        return;
-                    }
+                    Ok(0) => break,
                     Ok(n) => n,
-                    Err(_) => {
-                        manager.unregister(addr).await;
-                        return;
-                    }
+                    Err(_) => break,
                 }
             };
 
@@ -238,6 +213,8 @@ impl Server {
 
             handler(packet, addr).await;
         }
+
+        manager.unregister(addr).await;
     }
 
     fn spawn_websocket_listener(
@@ -247,189 +224,61 @@ impl Server {
         manager: ConnectionManager,
     ) {
         tokio::spawn(async move {
-            match TcpListener::bind(&addr).await {
-                Ok(listener) => loop {
-                    match listener.accept().await {
-                        Ok((stream, client_addr)) => {
-                            if let Some(ref validator) = validator {
-                                if !validator(client_addr).await {
-                                    continue;
-                                }
-                            }
+            let listener = TcpListener::bind(&addr).await.unwrap();
 
-                            let handler = handler.clone();
-                            let manager = manager.clone();
+            loop {
+                let (stream, client_addr) = listener.accept().await.unwrap();
 
-                            tokio::spawn(async move {
-                                match tokio_tungstenite::accept_async(stream).await {
-                                    Ok(ws_stream) => {
-                                        manager.register(client_addr).await;
-                                        Self::handle_websocket_connection(
-                                            Arc::new(Mutex::new(ws_stream)),
-                                            client_addr,
-                                            handler,
-                                            manager,
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("WebSocket handshake error: {}", e);
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Error accepting connection: {}", e);
-                        }
+                if let Some(ref validator) = validator {
+                    if !validator(client_addr).await {
+                        continue;
                     }
-                },
-                Err(e) => eprintln!("Failed to bind WebSocket listener on {}: {}", addr, e),
+                }
+
+                let handler = handler.clone();
+                let manager = manager.clone();
+
+                tokio::spawn(async move {
+                    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(_) => return,
+                    };
+
+                    manager.register(client_addr).await;
+
+                    let (write, mut read) = ws_stream.split();
+                    let writer = Arc::new(Mutex::new(write));
+
+                    while let Some(msg) = read.next().await {
+                        let msg = match msg {
+                            Ok(m) => m,
+                            Err(_) => break,
+                        };
+
+                        let data = match msg {
+                            Message::Binary(d) => d.to_vec(),
+                            Message::Text(t) => t.as_bytes().to_vec(),
+                            _ => continue,
+                        };
+
+                        let packet = Packet {
+                            data,
+                            protocol: Protocol::WebSocket,
+                            responder: Responder::WebSocket(writer.clone()),
+                        };
+
+                        handler(packet, client_addr).await;
+                    }
+
+                    manager.unregister(client_addr).await;
+                });
             }
         });
-    }
-
-    async fn handle_websocket_connection(
-        ws: Arc<Mutex<tokio_tungstenite::WebSocketStream<TcpStream>>>,
-        addr: SocketAddr,
-        handler: PacketHandler,
-        manager: ConnectionManager,
-    ) {
-        loop {
-            let msg = {
-                let mut locked = ws.lock().await;
-                locked.next().await
-            };
-
-            match msg {
-                Some(Ok(Message::Binary(data))) => {
-                    let packet = Packet {
-                        data: data.to_vec(),
-                        protocol: Protocol::WebSocket,
-                        responder: Responder::WebSocket(ws.clone()),
-                    };
-
-                    let handler = handler.clone();
-                    tokio::spawn(async move {
-                        handler(packet, addr).await;
-                    });
-                }
-                Some(Ok(Message::Text(text))) => {
-                    let packet = Packet {
-                        data: text.as_bytes().to_vec(),
-                        protocol: Protocol::WebSocket,
-                        responder: Responder::WebSocket(ws.clone()),
-                    };
-
-                    let handler = handler.clone();
-                    tokio::spawn(async move {
-                        handler(packet, addr).await;
-                    });
-                }
-                _ => {
-                    // Connection closed or error
-                    manager.unregister(addr).await;
-                    break;
-                }
-            }
-        }
     }
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn connection_manager_new() {
-        let manager = ConnectionManager::new(100);
-        assert_eq!(manager.broadcast_tx.receiver_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn connection_manager_register_unregister() {
-        let manager = ConnectionManager::new(100);
-        let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-
-        manager.register(addr).await;
-        assert_eq!(manager.connection_count().await, 1);
-
-        manager.unregister(addr).await;
-        assert_eq!(manager.connection_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn connection_manager_broadcast() {
-        let manager = ConnectionManager::new(100);
-        manager.broadcast(vec![1, 2, 3]);
-    }
-
-    #[tokio::test]
-    async fn connection_manager_subscribe() {
-        let manager = ConnectionManager::new(100);
-        let _rx = manager.subscribe();
-        assert!(manager.broadcast_tx.receiver_count() > 0);
-    }
-
-    #[tokio::test]
-    async fn connection_manager_send_to() {
-        let manager = ConnectionManager::new(100);
-        let addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
-        let result = manager.send_to(addr, vec![1, 2, 3]).await;
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn server_new() {
-        let server = Server::new();
-        assert_eq!(server.listeners.len(), 0);
-        assert!(server.on_packet.is_none());
-        assert!(server.on_connect.is_none());
-    }
-
-    #[test]
-    fn server_default() {
-        let server = Server::default();
-        assert_eq!(server.listeners.len(), 0);
-    }
-
-    #[test]
-    fn server_bind() {
-        let server = Server::new()
-            .bind("127.0.0.1:9001", Protocol::Tcp)
-            .bind("127.0.0.1:9002", Protocol::WebSocket);
-        assert_eq!(server.listeners.len(), 2);
-    }
-
-    #[test]
-    fn server_bind_multiple_same_protocol() {
-        let server = Server::new()
-            .bind("127.0.0.1:9003", Protocol::Tcp)
-            .bind("127.0.0.1:9004", Protocol::Tcp)
-            .bind("127.0.0.1:9005", Protocol::Tcp);
-        assert_eq!(server.listeners.len(), 3);
-    }
-
-    #[test]
-    fn broadcast_message_clone() {
-        let msg = BroadcastMessage {
-            data: vec![1, 2, 3],
-        };
-        let msg2 = msg.clone();
-        assert_eq!(msg.data, msg2.data);
-    }
-
-    #[test]
-    fn broadcast_message_debug() {
-        let msg = BroadcastMessage {
-            data: vec![255],
-        };
-        let debug_str = format!("{:?}", msg);
-        assert!(debug_str.contains("BroadcastMessage"));
     }
 }

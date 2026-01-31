@@ -56,20 +56,18 @@ impl Responder {
     async fn send(&mut self, data: &[u8]) {
         match self {
             Responder::Tcp(stream) => {
-                if let Ok(mut locked) = stream.try_lock() {
-                    let _ = locked.write_all(data).await;
-                }
+                let mut locked = stream.lock().await;
+                let _ = locked.write_all(data).await;
             }
             Responder::Udp(socket, addr) => {
                 let _ = socket.send_to(data, *addr).await;
             }
             Responder::WebSocket(ws) => {
-                if let Ok(mut locked) = ws.try_lock() {
-                    let msg = tokio_tungstenite::tungstenite::Message::Binary(
-                        tokio_tungstenite::tungstenite::Bytes::copy_from_slice(data)
-                    );
-                    let _ = locked.send(msg).await;
-                }
+                let mut locked = ws.lock().await;
+                let msg = tokio_tungstenite::tungstenite::Message::Binary(
+                    tokio_tungstenite::tungstenite::Bytes::copy_from_slice(data)
+                );
+                let _ = locked.send(msg).await;
             }
         }
     }

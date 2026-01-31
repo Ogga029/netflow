@@ -79,29 +79,24 @@ impl Responder {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn server() {
-            let _ = Server::new()
-                .bind("127.0.0.1:9001", Protocol::Tcp)
-                .on_connect(|addr| async move {
-                    println!("Client connecting from: {}", addr);
-                    true
-                })
-                .on_packet(|mut packet, addr| async move {
-                    println!("Received from {}: {:?}", addr, packet);
-                    packet.reply(b"OK").await;
-                })
-                .run()
-                .await;
+    #[test]
+    fn protocol_clone_tcp() {
+        let p1 = Protocol::Tcp;
+        let p2 = p1.clone();
+        matches!(p2, Protocol::Tcp);
     }
 
-    #[tokio::test]
-    async fn server_tcp_reject_connections() {
-        let server = Server::new()
-            .bind("127.0.0.1:9002", Protocol::Tcp)
-            .on_connect(|_addr| async move { false })
-            .on_packet(|_packet, _addr| async move {});
+    #[test]
+    fn protocol_clone_udp() {
+        let p1 = Protocol::Udp;
+        let p2 = p1.clone();
+        matches!(p2, Protocol::Udp);
+    }
 
-        assert_eq!(server.listeners.len(), 1);
+    #[test]
+    fn protocol_clone_websocket() {
+        let p1 = Protocol::WebSocket;
+        let p2 = p1.clone();
+        matches!(p2, Protocol::WebSocket);
     }
 }

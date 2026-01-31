@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use futures::SinkExt;
 
 pub mod client;
 pub mod server;
@@ -15,6 +16,7 @@ pub use server::Server;
 pub enum Protocol {
     Tcp,
     Udp,
+    WebSocket,
 }
 
 pub struct Packet {
@@ -28,6 +30,7 @@ impl fmt::Debug for Packet {
         let protocol_str = match self.protocol {
             Protocol::Tcp => "TCP",
             Protocol::Udp => "UDP",
+            Protocol::WebSocket => "WebSocket",
         };
         f.debug_struct("Packet")
             .field("data", &self.data)
@@ -46,6 +49,7 @@ impl Packet {
 pub(crate) enum Responder {
     Tcp(Arc<Mutex<TcpStream>>),
     Udp(Arc<UdpSocket>, SocketAddr),
+    WebSocket(Arc<Mutex<tokio_tungstenite::WebSocketStream<TcpStream>>>),
 }
 
 impl Responder {
@@ -58,6 +62,14 @@ impl Responder {
             }
             Responder::Udp(socket, addr) => {
                 let _ = socket.send_to(data, *addr).await;
+            }
+            Responder::WebSocket(ws) => {
+                if let Ok(mut locked) = ws.try_lock() {
+                    let msg = tokio_tungstenite::tungstenite::Message::Binary(
+                        tokio_tungstenite::tungstenite::Bytes::copy_from_slice(data)
+                    );
+                    let _ = locked.send(msg).await;
+                }
             }
         }
     }

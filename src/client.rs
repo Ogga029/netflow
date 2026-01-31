@@ -37,6 +37,9 @@ impl Client {
                 socket.connect(addr).await?;
                 Connection::Udp(Arc::new(socket))
             }
+            Protocol::WebSocket => {
+                return Err("WebSocket client not fully supported yet".into());
+            }
         };
 
         Ok(Self {

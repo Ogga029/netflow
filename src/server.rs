@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use crate::{Packet, Protocol, Responder};
+use tokio_tungstenite::tungstenite::Message;
+use futures::stream::StreamExt;
 
 type PacketHandler = Arc<
     dyn Fn(Packet, SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send>>
@@ -72,6 +74,9 @@ impl Server {
                 }
                 Protocol::Udp => {
                     Self::spawn_udp_listener(addr, on_packet.clone());
+                }
+                Protocol::WebSocket => {
+                    Self::spawn_websocket_listener(addr, on_packet.clone(), on_connect.clone());
                 }
             }
         }
@@ -169,6 +174,94 @@ impl Server {
             };
 
             handler(packet, addr).await;
+        }
+    }
+
+    fn spawn_websocket_listener(
+        addr: String,
+        handler: PacketHandler,
+        validator: Option<ConnectionValidator>,
+    ) {
+        tokio::spawn(async move {
+            match TcpListener::bind(&addr).await {
+                Ok(listener) => loop {
+                    match listener.accept().await {
+                        Ok((stream, client_addr)) => {
+                            if let Some(ref validator) = validator {
+                                if !validator(client_addr).await {
+                                    continue;
+                                }
+                            }
+
+                            let handler = handler.clone();
+
+                            tokio::spawn(async move {
+                                match tokio_tungstenite::accept_async(stream).await {
+                                    Ok(ws_stream) => {
+                                        Self::handle_websocket_connection(
+                                            Arc::new(Mutex::new(ws_stream)),
+                                            client_addr,
+                                            handler,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("WebSocket handshake error: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Error accepting connection: {}", e);
+                        }
+                    }
+                },
+                Err(e) => eprintln!("Failed to bind WebSocket listener on {}: {}", addr, e),
+            }
+        });
+    }
+
+    async fn handle_websocket_connection(
+        ws: Arc<Mutex<tokio_tungstenite::WebSocketStream<TcpStream>>>,
+        addr: SocketAddr,
+        handler: PacketHandler,
+    ) {
+        loop {
+            let msg = {
+                let mut locked = ws.lock().await;
+                locked.next().await
+            };
+
+            match msg {
+                Some(Ok(Message::Binary(data))) => {
+                    let packet = Packet {
+                        data: data.to_vec(),
+                        protocol: Protocol::WebSocket,
+                        responder: Responder::WebSocket(ws.clone()),
+                    };
+
+                    let handler = handler.clone();
+                    tokio::spawn(async move {
+                        handler(packet, addr).await;
+                    });
+                }
+                Some(Ok(Message::Text(text))) => {
+                    let packet = Packet {
+                        data: text.as_bytes().to_vec(),
+                        protocol: Protocol::WebSocket,
+                        responder: Responder::WebSocket(ws.clone()),
+                    };
+
+                    let handler = handler.clone();
+                    tokio::spawn(async move {
+                        handler(packet, addr).await;
+                    });
+                }
+                _ => {
+                    // Connection closed or error
+                    break;
+                }
+            }
         }
     }
 }

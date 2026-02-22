@@ -39,8 +39,12 @@ impl ConnectionManager {
     }
 
     pub async fn send_to(&self, addr: SocketAddr, data: &[u8]) -> Result<(), String> {
-        let conns = self.connections.read().await;
-        if let Some(responder) = conns.get(&addr) {
+        let responder = {
+            let conns = self.connections.read().await;
+            conns.get(&addr).cloned()
+        };
+
+        if let Some(responder) = responder {
             responder.send(data).await;
             Ok(())
         } else {
@@ -173,16 +177,10 @@ impl Server {
                 }
 
                 let handler = handler.clone();
-                let stream = Arc::new(Mutex::new(stream));
-                let manager = manager.clone();
-
-                // Register TCP connection correctly
-                manager
-                    .register(client_addr, Responder::Tcp(stream.clone()))
-                    .await;
+                let manager_clone = manager.clone();
 
                 tokio::spawn(async move {
-                    Self::handle_tcp_connection(stream, client_addr, handler, manager).await;
+                    Self::handle_tcp_connection(stream, client_addr, handler, manager_clone).await;
                 });
             }
         });
@@ -208,33 +206,47 @@ impl Server {
     }
 
     async fn handle_tcp_connection(
-        stream: Arc<Mutex<TcpStream>>,
+        stream: TcpStream,
         addr: SocketAddr,
         handler: PacketHandler,
         manager: ConnectionManager,
     ) {
+        let (mut reader, mut writer) = stream.into_split();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        manager.register(addr, Responder::Tcp(tx.clone())).await;
+
+        let write_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            while let Some(data) = rx.recv().await {
+                if writer.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut buffer = [0u8; 1024];
 
         loop {
-            let size = {
-                let mut locked = stream.lock().await;
-                match locked.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                }
+            let size = match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
             };
 
             let packet = Packet {
                 data: buffer[..size].to_vec(),
                 protocol: Protocol::Tcp,
-                responder: Responder::Tcp(stream.clone()),
+                responder: Responder::Tcp(tx.clone()),
             };
 
             handler(packet, addr).await;
         }
 
         manager.unregister(addr).await;
+        write_task.abort();
     }
 
     fn spawn_websocket_listener(
@@ -256,7 +268,7 @@ impl Server {
                 }
 
                 let handler = handler.clone();
-                let manager = manager.clone();
+                let manager_clone = manager.clone();
 
                 tokio::spawn(async move {
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
@@ -264,13 +276,23 @@ impl Server {
                         Err(_) => return,
                     };
 
-                    let (write, mut read) = ws_stream.split();
-                    let writer = Arc::new(Mutex::new(write));
+                    let (mut write, mut read) = ws_stream.split();
 
-                    // Register WebSocket connection
-                    manager
-                        .register(client_addr, Responder::WebSocket(writer.clone()))
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+                    manager_clone
+                        .register(client_addr, Responder::WebSocket(tx.clone()))
                         .await;
+
+                    let write_task = tokio::spawn(async move {
+                        use futures::SinkExt;
+
+                        while let Some(msg) = rx.recv().await {
+                            if write.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
 
                     while let Some(msg) = read.next().await {
                         let msg = match msg {
@@ -287,13 +309,14 @@ impl Server {
                         let packet = Packet {
                             data,
                             protocol: Protocol::WebSocket,
-                            responder: Responder::WebSocket(writer.clone()),
+                            responder: Responder::WebSocket(tx.clone()),
                         };
 
                         handler(packet, client_addr).await;
                     }
 
-                    manager.unregister(client_addr).await;
+                    manager_clone.unregister(client_addr).await;
+                    write_task.abort();
                 });
             }
         });

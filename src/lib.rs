@@ -46,35 +46,26 @@ impl Packet {
     }
 }
 
+use tokio::sync::mpsc;
+
+#[derive(Clone)]
 pub enum Responder {
-    Tcp(Arc<Mutex<TcpStream>>),
+    Tcp(mpsc::UnboundedSender<Vec<u8>>),
     Udp(Arc<UdpSocket>, SocketAddr),
-    WebSocket(
-        Arc<
-            Mutex<
-                futures::stream::SplitSink<
-                    tokio_tungstenite::WebSocketStream<TcpStream>,
-                    Message,
-                >,
-            >,
-        >,
-    ),
+    WebSocket(mpsc::UnboundedSender<Message>),
 }
 
 impl Responder {
-    async fn send(&self, data: &[u8]) {
+    pub async fn send(&self, data: &[u8]) {
         match self {
-            Responder::Tcp(stream) => {
-                let mut locked = stream.lock().await;
-                let _ = locked.write_all(data).await;
+            Responder::Tcp(tx) => {
+                let _ = tx.send(data.to_vec());
             }
             Responder::Udp(socket, addr) => {
-                let _ = socket.send_to(data, *addr).await;
+                let _ = socket.send_to(data, addr).await;
             }
-            Responder::WebSocket(writer) => {
-                let mut locked = writer.lock().await;
-                let msg = Message::binary(data.to_vec());
-                let _ = locked.send(msg).await;
+            Responder::WebSocket(tx) => {
+                let _ = tx.send(Message::Binary(data.to_vec().into()));
             }
         }
     }

@@ -13,12 +13,14 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Clone)]
 pub struct ConnectionManager {
     connections: Arc<RwLock<HashMap<SocketAddr, Responder>>>,
+    pub(crate) on_disconnect: Option<DisconnectHandler>,
 }
 
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            on_disconnect: None,
         }
     }
 
@@ -30,6 +32,10 @@ impl ConnectionManager {
     pub async fn unregister(&self, addr: SocketAddr) {
         let mut conns = self.connections.write().await;
         conns.remove(&addr);
+
+        if let Some(disconnect_handler) = &self.on_disconnect {
+            disconnect_handler(addr).await;
+        }
     }
 
     pub async fn send_to(&self, addr: SocketAddr, data: &[u8]) -> Result<(), String> {
@@ -60,10 +66,14 @@ type PacketHandler =
 type ConnectionValidator =
     Arc<dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
+type DisconnectHandler =
+    Arc<dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct Server {
     pub listeners: Vec<(String, Protocol)>,
     on_packet: Option<PacketHandler>,
     on_connect: Option<ConnectionValidator>,
+    on_disconnect: Option<DisconnectHandler>,
     pub connection_manager: ConnectionManager,
 }
 
@@ -73,6 +83,7 @@ impl Server {
             listeners: Vec::new(),
             on_packet: None,
             on_connect: None,
+            on_disconnect: None,
             connection_manager: ConnectionManager::new(),
         }
     }
@@ -97,6 +108,16 @@ impl Server {
         Fut: Future<Output = bool> + Send + 'static,
     {
         self.on_connect = Some(Arc::new(move |addr| Box::pin(func(addr))));
+        self
+    }
+
+    pub fn on_disconnect<F, Fut>(mut self, func: F) -> Self
+    where
+        F: Fn(SocketAddr) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_disconnect = Some(Arc::new(move |addr| Box::pin(func(addr))));
+        self.connection_manager.on_disconnect = self.on_disconnect.clone();
         self
     }
 

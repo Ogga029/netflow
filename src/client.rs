@@ -12,11 +12,13 @@ type MessageHandler = Arc<
         + Sync,
 >;
 
+#[derive(Clone)]
 enum Connection {
     Tcp(Arc<Mutex<TcpStream>>),
     Udp(Arc<UdpSocket>),
 }
 
+#[derive(Clone)]
 pub struct Client {
     connection: Connection,
     on_message: Option<MessageHandler>,

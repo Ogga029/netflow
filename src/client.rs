@@ -1,30 +1,40 @@
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, WebSocketStream};
+use tokio_tungstenite::MaybeTlsStream;
+use futures::{SinkExt, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use crate::Protocol;
 
-type MessageHandler = Arc<
-    dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+type MessageHandler<S> = Arc<
+    dyn Fn(Vec<u8>, Arc<S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 #[derive(Clone)]
 enum Connection {
     Tcp(Arc<Mutex<TcpStream>>),
     Udp(Arc<UdpSocket>),
+    WebSocket {
+        tx: Arc<mpsc::UnboundedSender<WsMessage>>,
+        reader: Arc<Mutex<futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+    },
 }
 
 #[derive(Clone)]
-pub struct Client {
+pub struct Client<S> {
     connection: Connection,
-    on_message: Option<MessageHandler>,
+    on_message: Option<MessageHandler<S>>,
+    state: Option<Arc<S>>,
 }
 
-impl Client {
+impl<S> Client<S>
+where
+    S: Send + Sync + 'static,
+{
     pub async fn connect(
         addr: &str,
         protocol: Protocol,
@@ -40,24 +50,46 @@ impl Client {
                 Connection::Udp(Arc::new(socket))
             }
             Protocol::WebSocket => {
-                return Err("WebSocket client not fully supported yet".into());
+                // `addr` should be a ws:// or wss:// URL for WebSocket
+                let (ws_stream, _) = connect_async(addr).await?;
+                let (write, read) = ws_stream.split();
+
+                let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+                // spawn writer task
+                tokio::spawn(async move {
+                    let mut write = write;
+                    while let Some(msg) = rx.recv().await {
+                        if write.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                Connection::WebSocket {
+                    tx: Arc::new(tx),
+                    reader: Arc::new(Mutex::new(read)),
+                }
             }
         };
 
         Ok(Self {
             connection,
             on_message: None,
+            state: None,
         })
+    }
+
+    pub fn with_state(mut self, state: Arc<S>) -> Self {
+        self.state = Some(state);
+        self
     }
 
     pub fn on_message<F, Fut>(mut self, func: F) -> Self
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Vec<u8>, Arc<S>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_message = Some(Arc::new(move |data| {
-            Box::pin(func(data))
-        }));
+        self.on_message = Some(Arc::new(move |data, state| Box::pin(func(data, state))));
         self
     }
 
@@ -70,12 +102,16 @@ impl Client {
             Connection::Udp(socket) => {
                 socket.send(data).await?;
             }
+            Connection::WebSocket { tx, .. } => {
+                let _ = tx.send(WsMessage::binary(data.to_vec()));
+            }
         }
         Ok(())
     }
 
     pub async fn listen(self) -> Result<(), Box<dyn std::error::Error>> {
         let handler = self.on_message.ok_or("Message handler not set")?;
+        let state = self.state.ok_or("State not set")?;
 
         match self.connection {
             Connection::Tcp(stream) => {
@@ -90,7 +126,7 @@ impl Client {
                         }
                     };
 
-                    handler(buffer[..size].to_vec()).await;
+                    handler(buffer[..size].to_vec(), state.clone()).await;
                 }
             }
             Connection::Udp(socket) => {
@@ -99,9 +135,27 @@ impl Client {
                     match socket.recv(&mut buffer).await {
                         Ok(0) => return Ok(()),
                         Ok(n) => {
-                            handler(buffer[..n].to_vec()).await;
+                            handler(buffer[..n].to_vec(), state.clone()).await;
                         }
                         Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Connection::WebSocket { reader, .. } => {
+                loop {
+                    let mut guard = reader.lock().await;
+                    match guard.next().await {
+                        Some(Ok(msg)) => {
+                            let data = match msg {
+                                WsMessage::Binary(d) => d.to_vec(),
+                                WsMessage::Text(t) => t.as_bytes().to_vec(),
+                                _ => continue,
+                            };
+
+                            handler(data, state.clone()).await;
+                        }
+                        Some(Err(e)) => return Err(e.into()),
+                        None => return Ok(()),
                     }
                 }
             }

@@ -10,6 +10,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 
+// TODO: MAKE ConnectionValidator work with UDP if possible
+
 // ---- ConnectionManager ----
 pub struct ConnectionManager<S> {
     connections: Arc<RwLock<HashMap<SocketAddr, Responder>>>,
@@ -34,7 +36,7 @@ impl<S> ConnectionManager<S> {
         conns.remove(&addr);
 
         if let Some(handler) = &self.on_disconnect {
-            handler(addr, state).await;
+            handler(addr, state, self.clone()).await;
         }
     }
 
@@ -77,12 +79,25 @@ impl<S> std::fmt::Debug for ConnectionManager<S> {
 
 // ---- Types ----
 type PacketHandler<S> = Arc<
-    dyn Fn(Packet, SocketAddr, Arc<S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+    dyn Fn(
+            Packet,
+            SocketAddr,
+            Arc<S>,
+            ConnectionManager<S>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
 >;
-type ConnectionValidator<S> =
-    Arc<dyn Fn(SocketAddr, Arc<S>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
-type DisconnectHandler<S> =
-    Arc<dyn Fn(SocketAddr, Arc<S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type ConnectionValidator<S> = Arc<
+    dyn Fn(SocketAddr, Arc<S>, ConnectionManager<S>) -> Pin<Box<dyn Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+type DisconnectHandler<S> = Arc<
+    dyn Fn(SocketAddr, Arc<S>, ConnectionManager<S>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 // ---- Server ----
 pub struct Server<S> {
@@ -116,30 +131,34 @@ where
 
     pub fn on_packet<F, Fut>(mut self, func: F) -> Self
     where
-        F: Fn(Packet, SocketAddr, Arc<S>) -> Fut + Send + Sync + 'static,
+        F: Fn(Packet, SocketAddr, Arc<S>, ConnectionManager<S>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_packet = Some(Arc::new(move |packet, addr, state| {
-            Box::pin(func(packet, addr, state))
+        self.on_packet = Some(Arc::new(move |packet, addr, state, cm| {
+            Box::pin(func(packet, addr, state, cm))
         }));
         self
     }
 
     pub fn on_connect<F, Fut>(mut self, func: F) -> Self
     where
-        F: Fn(SocketAddr, Arc<S>) -> Fut + Send + Sync + 'static,
+        F: Fn(SocketAddr, Arc<S>, ConnectionManager<S>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
-        self.on_connect = Some(Arc::new(move |addr, state| Box::pin(func(addr, state))));
+        self.on_connect = Some(Arc::new(move |addr, state, cm| {
+            Box::pin(func(addr, state, cm))
+        }));
         self
     }
 
     pub fn on_disconnect<F, Fut>(mut self, func: F) -> Self
     where
-        F: Fn(SocketAddr, Arc<S>) -> Fut + Send + Sync + 'static,
+        F: Fn(SocketAddr, Arc<S>, ConnectionManager<S>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_disconnect = Some(Arc::new(move |addr, state| Box::pin(func(addr, state))));
+        self.on_disconnect = Some(Arc::new(move |addr, state, cm| {
+            Box::pin(func(addr, state, cm))
+        }));
         self.connection_manager.on_disconnect = self.on_disconnect.clone();
         self
     }
@@ -161,7 +180,7 @@ where
                     Self::spawn_tcp_listener(addr, on_packet, on_connect, manager, state);
                 }
                 Protocol::Udp => {
-                    Self::spawn_udp_listener(addr, on_packet, state);
+                    Self::spawn_udp_listener(addr, on_packet, state, manager);
                 }
                 Protocol::WebSocket => {
                     Self::spawn_websocket_listener(addr, on_packet, on_connect, manager, state);
@@ -191,7 +210,7 @@ where
 
                 if let Some(ref validator) = validator {
                     let state_clone = state.clone();
-                    if !validator(client_addr, state_clone).await {
+                    if !validator(client_addr, state_clone, manager.clone()).await {
                         continue;
                     }
                 }
@@ -241,14 +260,14 @@ where
                 responder: Responder::Tcp(tx.clone()),
             };
 
-            handler(packet, addr, state.clone()).await;
+            handler(packet, addr, state.clone(), manager.clone()).await;
         }
 
         manager.unregister(addr, state).await;
         write_task.abort();
     }
 
-    fn spawn_udp_listener(addr: String, handler: PacketHandler<S>, state: Arc<S>) {
+    fn spawn_udp_listener(addr: String, handler: PacketHandler<S>, state: Arc<S>, manager: ConnectionManager<S>) {
         tokio::spawn(async move {
             let socket = Arc::new(UdpSocket::bind(&addr).await.unwrap());
             let mut buffer = [0u8; 1024];
@@ -263,8 +282,9 @@ where
 
                 let handler = handler.clone();
                 let state = state.clone();
+                let mg = manager.clone();
                 tokio::spawn(async move {
-                    handler(packet, client_addr, state).await;
+                    handler(packet, client_addr, state, mg).await;
                 });
             }
         });
@@ -288,7 +308,7 @@ where
 
                 if let Some(ref validator) = validator {
                     let state_clone = state.clone();
-                    if !validator(client_addr, state_clone).await {
+                    if !validator(client_addr, state_clone, manager.clone()).await {
                         continue;
                     }
                 }
@@ -336,8 +356,9 @@ where
 
                         let handler = handler.clone();
                         let state = state.clone();
+                        let mg = manager.clone();
                         tokio::spawn(async move {
-                            handler(packet, client_addr, state).await;
+                            handler(packet, client_addr, state, mg).await;
                         });
                     }
 

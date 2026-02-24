@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConnectionManager {
     connections: Arc<RwLock<HashMap<SocketAddr, Responder>>>,
     pub(crate) on_disconnect: Option<DisconnectHandler>,

@@ -48,7 +48,7 @@ impl Packet {
 
 use tokio::sync::mpsc;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Responder {
     Tcp(mpsc::UnboundedSender<Vec<u8>>),
     Udp(Arc<UdpSocket>, SocketAddr),

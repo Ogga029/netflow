@@ -10,10 +10,18 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnectionManager {
     connections: Arc<RwLock<HashMap<SocketAddr, Responder>>>,
     pub(crate) on_disconnect: Option<DisconnectHandler>,
+}
+
+impl std::fmt::Debug for ConnectionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionManager")
+            .field("connections", &self.connections)
+            .finish()
+    }
 }
 
 impl ConnectionManager {

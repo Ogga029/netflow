@@ -118,16 +118,16 @@ where
 
         match self.connection {
             Connection::Tcp(stream) => {
-                let mut locked = stream.lock().await;
-
                 loop {
                     let mut len_buf = [0u8; 4];
-                    locked.read_exact(&mut len_buf).await?;
-
-                    let packet_len = u32::from_be_bytes(len_buf) as usize;
-                    let mut packet_buf = vec![0u8; packet_len];
-
-                    locked.read_exact(&mut packet_buf).await?;
+                    let packet_buf = {
+                        let mut locked = stream.lock().await;
+                        locked.read_exact(&mut len_buf).await?;
+                        let packet_len = u32::from_be_bytes(len_buf) as usize;
+                        let mut packet_buf = vec![0u8; packet_len];
+                        locked.read_exact(&mut packet_buf).await?;
+                        packet_buf
+                    };
 
                     handler(packet_buf, state.clone()).await;
                 }
@@ -147,22 +147,27 @@ where
                     }
                 }
             }
-            Connection::WebSocket { reader, .. } => loop {
-                let mut guard = reader.lock().await;
-                match guard.next().await {
-                    Some(Ok(msg)) => {
-                        let data = match msg {
-                            WsMessage::Binary(d) => d.to_vec(),
-                            WsMessage::Text(t) => t.as_bytes().to_vec(),
-                            _ => continue,
-                        };
+            Connection::WebSocket { reader, .. } => {
+                while let Some(msg_result) = {
+                    let mut guard = reader.lock().await;
+                    guard.next().await
+                } {
+                    let msg = match msg_result {
+                        Ok(msg) => msg,
+                        Err(e) => return Err(e.into()),
+                    };
 
-                        handler(data, state.clone()).await;
-                    }
-                    Some(Err(e)) => return Err(e.into()),
-                    None => return Ok(()),
+                    let data = match msg {
+                        WsMessage::Binary(d) => d.to_vec(),
+                        WsMessage::Text(t) => t.as_bytes().to_vec(),
+                        _ => continue,
+                    };
+
+                    handler(data, state.clone()).await;
                 }
-            },
+
+                Ok(())
+            }
         }
     }
 }

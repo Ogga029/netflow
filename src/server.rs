@@ -233,7 +233,6 @@ where
         manager: ConnectionManager<S>,
         state: Arc<S>,
     ) {
-        use tokio::io::AsyncReadExt;
         let (mut reader, mut writer) = stream.into_split();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 

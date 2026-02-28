@@ -97,10 +97,11 @@ where
         match &self.connection {
             Connection::Tcp(stream) => {
                 let mut locked = stream.lock().await;
-                let mut buf = Vec::with_capacity(4 + data.len());
-                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                buf.extend_from_slice(data);
-                locked.write_all(&buf).await?;
+
+                let len_bytes = (data.len() as u32).to_be_bytes();
+                locked.write_all(&len_bytes).await?;
+
+                locked.write_all(data).await?;
             }
             Connection::Udp(socket) => {
                 socket.send(data).await?;
@@ -111,25 +112,24 @@ where
         }
         Ok(())
     }
-
     pub async fn listen(self) -> Result<(), Box<dyn std::error::Error>> {
         let handler = self.on_message.ok_or("Message handler not set")?;
         let state = self.state.ok_or("State not set")?;
 
         match self.connection {
             Connection::Tcp(stream) => {
-                let mut buffer = [0u8; 1024];
-                loop {
-                    let size = {
-                        let mut locked = stream.lock().await;
-                        match locked.read(&mut buffer).await {
-                            Ok(0) => return Ok(()),
-                            Ok(n) => n,
-                            Err(e) => return Err(e.into()),
-                        }
-                    };
+                let mut locked = stream.lock().await;
 
-                    handler(buffer[..size].to_vec(), state.clone()).await;
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    locked.read_exact(&mut len_buf).await?;
+
+                    let packet_len = u32::from_be_bytes(len_buf) as usize;
+                    let mut packet_buf = vec![0u8; packet_len];
+
+                    locked.read_exact(&mut packet_buf).await?;
+
+                    handler(packet_buf, state.clone()).await;
                 }
             }
             Connection::Udp(socket) => {

@@ -241,6 +241,10 @@ where
         // Writer task
         let write_task = tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
+                let len_bytes = (data.len() as u32).to_be_bytes();
+                if writer.write_all(&len_bytes).await.is_err() {
+                    break;
+                }
                 if writer.write_all(&data).await.is_err() {
                     break;
                 }

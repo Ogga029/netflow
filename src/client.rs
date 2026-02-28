@@ -1,18 +1,17 @@
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, WebSocketStream};
-use tokio_tungstenite::MaybeTlsStream;
+use crate::Protocol;
 use futures::{SinkExt, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use crate::Protocol;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message as WsMessage};
 
-type MessageHandler<S> = Arc<
-    dyn Fn(Vec<u8>, Arc<S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+type MessageHandler<S> =
+    Arc<dyn Fn(Vec<u8>, Arc<S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 #[derive(Clone)]
 enum Connection {
@@ -20,7 +19,8 @@ enum Connection {
     Udp(Arc<UdpSocket>),
     WebSocket {
         tx: Arc<mpsc::UnboundedSender<WsMessage>>,
-        reader: Arc<Mutex<futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+        reader:
+            Arc<Mutex<futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
     },
 }
 
@@ -97,7 +97,10 @@ where
         match &self.connection {
             Connection::Tcp(stream) => {
                 let mut locked = stream.lock().await;
-                locked.write_all(data).await?;
+                let mut buf = Vec::with_capacity(4 + data.len());
+                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(data);
+                locked.write_all(&buf).await?;
             }
             Connection::Udp(socket) => {
                 socket.send(data).await?;
@@ -130,35 +133,36 @@ where
                 }
             }
             Connection::Udp(socket) => {
-                let mut buffer = [0u8; 1024];
                 loop {
+                    // Allocate buffer for max UDP packet size
+                    let mut buffer = vec![0u8; 65535];
+
                     match socket.recv(&mut buffer).await {
-                        Ok(0) => return Ok(()),
+                        Ok(0) => return Ok(()), // connection closed
                         Ok(n) => {
-                            handler(buffer[..n].to_vec(), state.clone()).await;
+                            buffer.truncate(n); // shrink to actual size
+                            handler(buffer, state.clone()).await;
                         }
                         Err(e) => return Err(e.into()),
                     }
                 }
             }
-            Connection::WebSocket { reader, .. } => {
-                loop {
-                    let mut guard = reader.lock().await;
-                    match guard.next().await {
-                        Some(Ok(msg)) => {
-                            let data = match msg {
-                                WsMessage::Binary(d) => d.to_vec(),
-                                WsMessage::Text(t) => t.as_bytes().to_vec(),
-                                _ => continue,
-                            };
+            Connection::WebSocket { reader, .. } => loop {
+                let mut guard = reader.lock().await;
+                match guard.next().await {
+                    Some(Ok(msg)) => {
+                        let data = match msg {
+                            WsMessage::Binary(d) => d.to_vec(),
+                            WsMessage::Text(t) => t.as_bytes().to_vec(),
+                            _ => continue,
+                        };
 
-                            handler(data, state.clone()).await;
-                        }
-                        Some(Err(e)) => return Err(e.into()),
-                        None => return Ok(()),
+                        handler(data, state.clone()).await;
                     }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
                 }
-            }
+            },
         }
     }
 }

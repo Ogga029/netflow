@@ -233,11 +233,13 @@ where
         manager: ConnectionManager<S>,
         state: Arc<S>,
     ) {
+        use tokio::io::AsyncReadExt;
         let (mut reader, mut writer) = stream.into_split();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
         manager.register(addr, Responder::Tcp(tx.clone())).await;
 
+        // Writer task
         let write_task = tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 if writer.write_all(&data).await.is_err() {
@@ -246,16 +248,22 @@ where
             }
         });
 
-        let mut buffer = [0u8; 1024];
+        let mut len_buf = [0u8; 4];
+
         loop {
-            let size = match reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
+            if let Err(_) = reader.read_exact(&mut len_buf).await {
+                break;
+            }
+
+            let packet_len = u32::from_be_bytes(len_buf) as usize;
+            let mut packet_buf = vec![0u8; packet_len];
+
+            if let Err(_) = reader.read_exact(&mut packet_buf).await {
+                break;
+            }
 
             let packet = Packet {
-                data: buffer[..size].to_vec(),
+                data: packet_buf,
                 protocol: Protocol::Tcp,
                 responder: Responder::Tcp(tx.clone()),
             };
@@ -267,15 +275,29 @@ where
         write_task.abort();
     }
 
-    fn spawn_udp_listener(addr: String, handler: PacketHandler<S>, state: Arc<S>, manager: ConnectionManager<S>) {
+    fn spawn_udp_listener(
+        addr: String,
+        handler: PacketHandler<S>,
+        state: Arc<S>,
+        manager: ConnectionManager<S>,
+    ) {
         tokio::spawn(async move {
             let socket = Arc::new(UdpSocket::bind(&addr).await.unwrap());
-            let mut buffer = [0u8; 1024];
 
             loop {
-                let (size, client_addr) = socket.recv_from(&mut buffer).await.unwrap();
+                // Allocate buffer for max UDP packet size (65535 bytes)
+                let mut buffer = vec![0u8; 65535];
+
+                let (size, client_addr) = match socket.recv_from(&mut buffer).await {
+                    Ok(res) => res,
+                    Err(_) => continue,
+                };
+
+                // Shrink buffer to actual received size
+                buffer.truncate(size);
+
                 let packet = Packet {
-                    data: buffer[..size].to_vec(),
+                    data: buffer,
                     protocol: Protocol::Udp,
                     responder: Responder::Udp(socket.clone(), client_addr),
                 };
@@ -283,6 +305,7 @@ where
                 let handler = handler.clone();
                 let state = state.clone();
                 let mg = manager.clone();
+
                 tokio::spawn(async move {
                     handler(packet, client_addr, state, mg).await;
                 });

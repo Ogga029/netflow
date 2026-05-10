@@ -12,6 +12,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 // TODO: MAKE ConnectionValidator work with UDP if possible
 
+#[derive(Clone, Copy, Debug)]
+pub enum TcpMode {
+    LengthPrefixed,
+    Raw,
+}
+
 // ---- ConnectionManager ----
 pub struct ConnectionManager<S> {
     connections: Arc<RwLock<HashMap<SocketAddr, Responder>>>,
@@ -88,11 +94,13 @@ type PacketHandler<S> = Arc<
         + Send
         + Sync,
 >;
+
 type ConnectionValidator<S> = Arc<
     dyn Fn(SocketAddr, Arc<S>, ConnectionManager<S>) -> Pin<Box<dyn Future<Output = bool> + Send>>
         + Send
         + Sync,
 >;
+
 type DisconnectHandler<S> = Arc<
     dyn Fn(SocketAddr, Arc<S>, ConnectionManager<S>) -> Pin<Box<dyn Future<Output = ()> + Send>>
         + Send
@@ -102,6 +110,7 @@ type DisconnectHandler<S> = Arc<
 // ---- Server ----
 pub struct Server<S> {
     pub listeners: Vec<(String, Protocol)>,
+    tcp_mode: TcpMode,
     on_packet: Option<PacketHandler<S>>,
     on_connect: Option<ConnectionValidator<S>>,
     on_disconnect: Option<DisconnectHandler<S>>,
@@ -116,6 +125,7 @@ where
     pub fn new(state: Arc<S>) -> Self {
         Self {
             listeners: Vec::new(),
+            tcp_mode: TcpMode::LengthPrefixed,
             on_packet: None,
             on_connect: None,
             on_disconnect: None,
@@ -129,6 +139,11 @@ where
         self
     }
 
+    pub fn tcp_mode(mut self, mode: TcpMode) -> Self {
+        self.tcp_mode = mode;
+        self
+    }
+
     pub fn on_packet<F, Fut>(mut self, func: F) -> Self
     where
         F: Fn(Packet, SocketAddr, Arc<S>, ConnectionManager<S>) -> Fut + Send + Sync + 'static,
@@ -137,6 +152,7 @@ where
         self.on_packet = Some(Arc::new(move |packet, addr, state, cm| {
             Box::pin(func(packet, addr, state, cm))
         }));
+
         self
     }
 
@@ -148,6 +164,7 @@ where
         self.on_connect = Some(Arc::new(move |addr, state, cm| {
             Box::pin(func(addr, state, cm))
         }));
+
         self
     }
 
@@ -159,7 +176,9 @@ where
         self.on_disconnect = Some(Arc::new(move |addr, state, cm| {
             Box::pin(func(addr, state, cm))
         }));
+
         self.connection_manager.on_disconnect = self.on_disconnect.clone();
+
         self
     }
 
@@ -168,6 +187,7 @@ where
         let on_connect = self.on_connect.clone();
         let manager = self.connection_manager.clone();
         let state = self.state.clone();
+        let tcp_mode = self.tcp_mode;
 
         for (addr, protocol) in self.listeners {
             let on_packet = on_packet.clone();
@@ -177,18 +197,34 @@ where
 
             match protocol {
                 Protocol::Tcp => {
-                    Self::spawn_tcp_listener(addr, on_packet, on_connect, manager, state);
+                    Self::spawn_tcp_listener(
+                        addr,
+                        on_packet,
+                        on_connect,
+                        manager,
+                        state,
+                        tcp_mode,
+                    );
                 }
+
                 Protocol::Udp => {
                     Self::spawn_udp_listener(addr, on_packet, state, manager);
                 }
+
                 Protocol::WebSocket => {
-                    Self::spawn_websocket_listener(addr, on_packet, on_connect, manager, state);
+                    Self::spawn_websocket_listener(
+                        addr,
+                        on_packet,
+                        on_connect,
+                        manager,
+                        state,
+                    );
                 }
             }
         }
 
         std::future::pending::<()>().await;
+
         Ok(())
     }
 
@@ -198,18 +234,21 @@ where
         validator: Option<ConnectionValidator<S>>,
         manager: ConnectionManager<S>,
         state: Arc<S>,
+        tcp_mode: TcpMode,
     ) {
         tokio::spawn(async move {
             let listener = TcpListener::bind(&addr).await.unwrap();
 
             loop {
                 let (stream, client_addr) = listener.accept().await.unwrap();
+
                 let handler = handler.clone();
                 let manager = manager.clone();
                 let state = state.clone();
 
                 if let Some(ref validator) = validator {
                     let state_clone = state.clone();
+
                     if !validator(client_addr, state_clone, manager.clone()).await {
                         continue;
                     }
@@ -221,6 +260,7 @@ where
                     handler,
                     manager,
                     state,
+                    tcp_mode,
                 ));
             }
         });
@@ -232,8 +272,10 @@ where
         handler: PacketHandler<S>,
         manager: ConnectionManager<S>,
         state: Arc<S>,
+        tcp_mode: TcpMode,
     ) {
         let (mut reader, mut writer) = stream.into_split();
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
         manager.register(addr, Responder::Tcp(tx.clone())).await;
@@ -241,40 +283,78 @@ where
         // Writer task
         let write_task = tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                let len_bytes = (data.len() as u32).to_be_bytes();
-                if writer.write_all(&len_bytes).await.is_err() {
-                    break;
-                }
-                if writer.write_all(&data).await.is_err() {
-                    break;
+                match tcp_mode {
+                    TcpMode::LengthPrefixed => {
+                        let len_bytes = (data.len() as u32).to_be_bytes();
+
+                        if writer.write_all(&len_bytes).await.is_err() {
+                            break;
+                        }
+
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    TcpMode::Raw => {
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
 
-        let mut len_buf = [0u8; 4];
+        match tcp_mode {
+            TcpMode::LengthPrefixed => {
+                let mut len_buf = [0u8; 4];
 
-        loop {
-            if let Err(_) = reader.read_exact(&mut len_buf).await {
-                break;
+                loop {
+                    if reader.read_exact(&mut len_buf).await.is_err() {
+                        break;
+                    }
+
+                    let packet_len = u32::from_be_bytes(len_buf) as usize;
+
+                    let mut packet_buf = vec![0u8; packet_len];
+
+                    if reader.read_exact(&mut packet_buf).await.is_err() {
+                        break;
+                    }
+
+                    let packet = Packet {
+                        data: packet_buf,
+                        protocol: Protocol::Tcp,
+                        responder: Responder::Tcp(tx.clone()),
+                    };
+
+                    handler(packet, addr, state.clone(), manager.clone()).await;
+                }
             }
 
-            let packet_len = u32::from_be_bytes(len_buf) as usize;
-            let mut packet_buf = vec![0u8; packet_len];
+            TcpMode::Raw => {
+                let mut buffer = vec![0u8; 4096];
 
-            if let Err(_) = reader.read_exact(&mut packet_buf).await {
-                break;
+                loop {
+                    let size = match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(size) => size,
+                        Err(_) => break,
+                    };
+
+                    let packet = Packet {
+                        data: buffer[..size].to_vec(),
+                        protocol: Protocol::Tcp,
+                        responder: Responder::Tcp(tx.clone()),
+                    };
+
+                    handler(packet, addr, state.clone(), manager.clone()).await;
+                }
             }
-
-            let packet = Packet {
-                data: packet_buf,
-                protocol: Protocol::Tcp,
-                responder: Responder::Tcp(tx.clone()),
-            };
-
-            handler(packet, addr, state.clone(), manager.clone()).await;
         }
 
         manager.unregister(addr, state).await;
+
         write_task.abort();
     }
 
@@ -328,12 +408,14 @@ where
 
             loop {
                 let (stream, client_addr) = listener.accept().await.unwrap();
+
                 let handler = handler.clone();
                 let manager = manager.clone();
                 let state = state.clone();
 
                 if let Some(ref validator) = validator {
                     let state_clone = state.clone();
+
                     if !validator(client_addr, state_clone, manager.clone()).await {
                         continue;
                     }
@@ -344,8 +426,11 @@ where
                         Ok(ws) => ws,
                         Err(_) => return,
                     };
+
                     let (mut write, mut read) = ws_stream.split();
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::unbounded_channel::<Message>();
 
                     manager
                         .register(client_addr, Responder::WebSocket(tx.clone()))
@@ -353,6 +438,7 @@ where
 
                     let write_task = tokio::spawn(async move {
                         use futures::SinkExt;
+
                         while let Some(msg) = rx.recv().await {
                             if write.send(msg).await.is_err() {
                                 break;
@@ -362,6 +448,7 @@ where
 
                     let handler = handler.clone();
                     let state = state.clone();
+
                     while let Some(msg) = read.next().await {
                         let msg = match msg {
                             Ok(m) => m,
@@ -383,12 +470,14 @@ where
                         let handler = handler.clone();
                         let state = state.clone();
                         let mg = manager.clone();
+
                         tokio::spawn(async move {
                             handler(packet, client_addr, state, mg).await;
                         });
                     }
 
                     manager.unregister(client_addr, state).await;
+
                     write_task.abort();
                 });
             }

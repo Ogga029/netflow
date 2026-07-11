@@ -1,12 +1,13 @@
 use crate::Protocol;
 use futures::{SinkExt, StreamExt};
 use std::future::Future;
+use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message as WsMessage};
 
@@ -15,12 +16,16 @@ type MessageHandler<S> =
 
 #[derive(Clone)]
 enum Connection {
-    Tcp(Arc<Mutex<TcpStream>>),
+    Tcp {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+        reader: Arc<Mutex<Option<OwnedReadHalf>>>,
+    },
     Udp(Arc<UdpSocket>),
     WebSocket {
-        tx: Arc<mpsc::UnboundedSender<WsMessage>>,
-        reader:
-            Arc<Mutex<futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+        tx: mpsc::UnboundedSender<WsMessage>,
+        reader: Arc<
+            Mutex<Option<futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+        >,
     },
 }
 
@@ -42,7 +47,30 @@ where
         let connection = match protocol {
             Protocol::Tcp => {
                 let stream = TcpStream::connect(addr).await?;
-                Connection::Tcp(Arc::new(Mutex::new(stream)))
+                let (reader, mut writer) = stream.into_split();
+
+                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                tokio::spawn(async move {
+                    while let Some(data) = rx.recv().await {
+                        let len = match u32::try_from(data.len()) {
+                            Ok(len) => len,
+                            Err(_) => break,
+                        };
+
+                        if writer.write_all(&len.to_be_bytes()).await.is_err() {
+                            break;
+                        }
+
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                Connection::Tcp {
+                    tx,
+                    reader: Arc::new(Mutex::new(Some(reader))),
+                }
             }
             Protocol::Udp => {
                 let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -50,14 +78,11 @@ where
                 Connection::Udp(Arc::new(socket))
             }
             Protocol::WebSocket => {
-                // `addr` should be a ws:// or wss:// URL for WebSocket
                 let (ws_stream, _) = connect_async(addr).await?;
-                let (write, read) = ws_stream.split();
+                let (mut write, read) = ws_stream.split();
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
-                // spawn writer task
                 tokio::spawn(async move {
-                    let mut write = write;
                     while let Some(msg) = rx.recv().await {
                         if write.send(msg).await.is_err() {
                             break;
@@ -66,8 +91,8 @@ where
                 });
 
                 Connection::WebSocket {
-                    tx: Arc::new(tx),
-                    reader: Arc::new(Mutex::new(read)),
+                    tx,
+                    reader: Arc::new(Mutex::new(Some(read))),
                 }
             }
         };
@@ -95,67 +120,91 @@ where
 
     pub async fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         match &self.connection {
-            Connection::Tcp(stream) => {
-                let mut locked = stream.lock().await;
-
-                let len_bytes = (data.len() as u32).to_be_bytes();
-                locked.write_all(&len_bytes).await?;
-
-                locked.write_all(data).await?;
+            Connection::Tcp { tx, .. } => {
+                u32::try_from(data.len())
+                    .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "TCP frame too large"))?;
+                tx.send(data.to_vec())
+                    .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "tcp writer closed"))?;
             }
             Connection::Udp(socket) => {
                 socket.send(data).await?;
             }
             Connection::WebSocket { tx, .. } => {
-                let _ = tx.send(WsMessage::binary(data.to_vec()));
+                tx.send(WsMessage::binary(data.to_vec())).map_err(|_| {
+                    io::Error::new(ErrorKind::BrokenPipe, "websocket writer closed")
+                })?;
             }
         }
+
         Ok(())
     }
+
     pub async fn listen(self) -> Result<(), Box<dyn std::error::Error>> {
-        let handler = self.on_message.ok_or("Message handler not set")?;
-        let state = self.state.ok_or("State not set")?;
+        let handler = self
+            .on_message
+            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Message handler not set"))?;
+        let state = self
+            .state
+            .ok_or_else(|| io::Error::new(ErrorKind::Other, "State not set"))?;
 
         match self.connection {
-            Connection::Tcp(stream) => {
+            Connection::Tcp { reader, .. } => {
+                let mut reader = {
+                    let mut guard = reader.lock().await;
+                    guard.take().ok_or_else(|| {
+                        io::Error::new(ErrorKind::Other, "TCP reader already taken")
+                    })?
+                };
+
                 loop {
                     let mut len_buf = [0u8; 4];
-                    let packet_buf = {
-                        let mut locked = stream.lock().await;
-                        locked.read_exact(&mut len_buf).await?;
-                        let packet_len = u32::from_be_bytes(len_buf) as usize;
-                        let mut packet_buf = vec![0u8; packet_len];
-                        locked.read_exact(&mut packet_buf).await?;
-                        packet_buf
-                    };
+                    match reader.read_exact(&mut len_buf).await {
+                        Ok(_) => {}
+                        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+                        Err(err) => return Err(err.into()),
+                    }
 
-                    handler(packet_buf, state.clone()).await;
+                    let packet_len = u32::from_be_bytes(len_buf) as usize;
+                    if packet_len > crate::MAX_FRAME_SIZE {
+                        return Err(
+                            io::Error::new(ErrorKind::InvalidData, "TCP frame too large").into(),
+                        );
+                    }
+
+                    let mut packet_buf = vec![0u8; packet_len];
+                    reader.read_exact(&mut packet_buf).await?;
+
+                    let handler = handler.clone();
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        handler(packet_buf, state).await;
+                    });
                 }
             }
             Connection::Udp(socket) => {
-                loop {
-                    // Allocate buffer for max UDP packet size
-                    let mut buffer = vec![0u8; 65535];
+                let mut buffer = vec![0u8; 65535];
 
-                    match socket.recv(&mut buffer).await {
-                        Ok(0) => return Ok(()), // connection closed
-                        Ok(n) => {
-                            buffer.truncate(n); // shrink to actual size
-                            handler(buffer, state.clone()).await;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
+                loop {
+                    let size = socket.recv(&mut buffer).await?;
+                    let data = buffer[..size].to_vec();
+
+                    let handler = handler.clone();
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        handler(data, state).await;
+                    });
                 }
             }
             Connection::WebSocket { reader, .. } => {
-                while let Some(msg_result) = {
+                let mut reader = {
                     let mut guard = reader.lock().await;
-                    guard.next().await
-                } {
-                    let msg = match msg_result {
-                        Ok(msg) => msg,
-                        Err(e) => return Err(e.into()),
-                    };
+                    guard.take().ok_or_else(|| {
+                        io::Error::new(ErrorKind::Other, "WebSocket reader already taken")
+                    })?
+                };
+
+                while let Some(msg_result) = reader.next().await {
+                    let msg = msg_result?;
 
                     let data = match msg {
                         WsMessage::Binary(d) => d.to_vec(),
@@ -163,7 +212,11 @@ where
                         _ => continue,
                     };
 
-                    handler(data, state.clone()).await;
+                    let handler = handler.clone();
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        handler(data, state).await;
+                    });
                 }
 
                 Ok(())

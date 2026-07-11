@@ -1,14 +1,19 @@
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{UdpSocket};
+use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::Message;
 
 pub mod client;
 pub mod server;
 
+pub use client::Client;
+pub use server::{Server, TcpMode};
 
-#[derive(Clone)]
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -38,8 +43,8 @@ impl fmt::Debug for Packet {
 }
 
 impl Packet {
-    pub async fn reply(&self, data: &[u8]) {
-        self.responder.send(data).await;
+    pub async fn reply(&self, data: &[u8]) -> io::Result<()> {
+        self.responder.send(data).await
     }
 }
 
@@ -53,16 +58,23 @@ pub enum Responder {
 }
 
 impl Responder {
-    pub async fn send(&self, data: &[u8]) {
+    pub async fn send(&self, data: &[u8]) -> io::Result<()> {
         match self {
             Responder::Tcp(tx) => {
-                let _ = tx.send(data.to_vec());
+                tx.send(data.to_vec())
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tcp writer closed"))?;
+                Ok(())
             }
             Responder::Udp(socket, addr) => {
-                let _ = socket.send_to(data, addr).await;
+                socket.send_to(data, addr).await?;
+                Ok(())
             }
             Responder::WebSocket(tx) => {
-                let _ = tx.send(Message::Binary(data.to_vec().into()));
+                tx.send(Message::Binary(data.to_vec().into()))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "websocket writer closed")
+                    })?;
+                Ok(())
             }
         }
     }

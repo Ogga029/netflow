@@ -1,5 +1,5 @@
 use crate::{Packet, Protocol, Responder};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -38,8 +38,10 @@ impl<S> ConnectionManager<S> {
     }
 
     pub async fn unregister(&self, addr: SocketAddr, state: Arc<S>) {
-        let mut conns = self.connections.write().await;
-        conns.remove(&addr);
+        {
+            let mut conns = self.connections.write().await;
+            conns.remove(&addr);
+        }
 
         if let Some(handler) = &self.on_disconnect {
             handler(addr, state, self.clone()).await;
@@ -48,17 +50,26 @@ impl<S> ConnectionManager<S> {
 
     pub async fn send_to(&self, addr: SocketAddr, data: &[u8]) -> Result<(), String> {
         if let Some(responder) = self.connections.read().await.get(&addr).cloned() {
-            responder.send(data).await;
-            Ok(())
+            responder.send(data).await.map_err(|err| err.to_string())
         } else {
             Err("Client not found".to_string())
         }
     }
 
     pub async fn broadcast(&self, data: &[u8]) {
-        for responder in self.connections.read().await.values() {
-            responder.send(data).await;
-        }
+        let responders = {
+            self.connections
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        join_all(responders.into_iter().map(|responder| async move {
+            let _ = responder.send(data).await;
+        }))
+        .await;
     }
 
     pub async fn connection_count(&self) -> usize {
@@ -197,14 +208,7 @@ where
 
             match protocol {
                 Protocol::Tcp => {
-                    Self::spawn_tcp_listener(
-                        addr,
-                        on_packet,
-                        on_connect,
-                        manager,
-                        state,
-                        tcp_mode,
-                    );
+                    Self::spawn_tcp_listener(addr, on_packet, on_connect, manager, state, tcp_mode);
                 }
 
                 Protocol::Udp => {
@@ -212,13 +216,7 @@ where
                 }
 
                 Protocol::WebSocket => {
-                    Self::spawn_websocket_listener(
-                        addr,
-                        on_packet,
-                        on_connect,
-                        manager,
-                        state,
-                    );
+                    Self::spawn_websocket_listener(addr, on_packet, on_connect, manager, state);
                 }
             }
         }
@@ -237,10 +235,22 @@ where
         tcp_mode: TcpMode,
     ) {
         tokio::spawn(async move {
-            let listener = TcpListener::bind(&addr).await.unwrap();
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    eprintln!("Failed to bind TCP listener on {}: {}", addr, err);
+                    return;
+                }
+            };
 
             loop {
-                let (stream, client_addr) = listener.accept().await.unwrap();
+                let (stream, client_addr) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        eprintln!("Error accepting TCP connection on {}: {}", addr, err);
+                        continue;
+                    }
+                };
 
                 let handler = handler.clone();
                 let manager = manager.clone();
@@ -285,9 +295,12 @@ where
             while let Some(data) = rx.recv().await {
                 match tcp_mode {
                     TcpMode::LengthPrefixed => {
-                        let len_bytes = (data.len() as u32).to_be_bytes();
+                        let len = match u32::try_from(data.len()) {
+                            Ok(len) => len,
+                            Err(_) => break,
+                        };
 
-                        if writer.write_all(&len_bytes).await.is_err() {
+                        if writer.write_all(&len.to_be_bytes()).await.is_err() {
                             break;
                         }
 
@@ -315,6 +328,9 @@ where
                     }
 
                     let packet_len = u32::from_be_bytes(len_buf) as usize;
+                    if packet_len > crate::MAX_FRAME_SIZE {
+                        break;
+                    }
 
                     let mut packet_buf = vec![0u8; packet_len];
 
@@ -328,7 +344,12 @@ where
                         responder: Responder::Tcp(tx.clone()),
                     };
 
-                    handler(packet, addr, state.clone(), manager.clone()).await;
+                    let handler = handler.clone();
+                    let state = state.clone();
+                    let manager = manager.clone();
+                    tokio::spawn(async move {
+                        handler(packet, addr, state, manager).await;
+                    });
                 }
             }
 
@@ -348,7 +369,12 @@ where
                         responder: Responder::Tcp(tx.clone()),
                     };
 
-                    handler(packet, addr, state.clone(), manager.clone()).await;
+                    let handler = handler.clone();
+                    let state = state.clone();
+                    let manager = manager.clone();
+                    tokio::spawn(async move {
+                        handler(packet, addr, state, manager).await;
+                    });
                 }
             }
         }
@@ -365,7 +391,13 @@ where
         manager: ConnectionManager<S>,
     ) {
         tokio::spawn(async move {
-            let socket = Arc::new(UdpSocket::bind(&addr).await.unwrap());
+            let socket = match UdpSocket::bind(&addr).await {
+                Ok(socket) => Arc::new(socket),
+                Err(err) => {
+                    eprintln!("Failed to bind UDP listener on {}: {}", addr, err);
+                    return;
+                }
+            };
 
             loop {
                 // Allocate buffer for max UDP packet size (65535 bytes)
@@ -404,10 +436,22 @@ where
         state: Arc<S>,
     ) {
         tokio::spawn(async move {
-            let listener = TcpListener::bind(&addr).await.unwrap();
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    eprintln!("Failed to bind WebSocket listener on {}: {}", addr, err);
+                    return;
+                }
+            };
 
             loop {
-                let (stream, client_addr) = listener.accept().await.unwrap();
+                let (stream, client_addr) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        eprintln!("Error accepting WebSocket connection on {}: {}", addr, err);
+                        continue;
+                    }
+                };
 
                 let handler = handler.clone();
                 let manager = manager.clone();
@@ -429,8 +473,7 @@ where
 
                     let (mut write, mut read) = ws_stream.split();
 
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::unbounded_channel::<Message>();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
                     manager
                         .register(client_addr, Responder::WebSocket(tx.clone()))

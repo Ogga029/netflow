@@ -329,6 +329,11 @@ where
 
                     let packet_len = u32::from_be_bytes(len_buf) as usize;
                     if packet_len > crate::MAX_FRAME_SIZE {
+                        eprintln!(
+                            "Client {} sent oversized frame ({} bytes) - dropping",
+                            addr,
+                            packet_len
+                        );
                         break;
                     }
 
@@ -347,14 +352,12 @@ where
                     let handler = handler.clone();
                     let state = state.clone();
                     let manager = manager.clone();
-                    tokio::spawn(async move {
-                        handler(packet, addr, state, manager).await;
-                    });
+                    handler(packet, addr, state, manager).await;
                 }
             }
 
             TcpMode::Raw => {
-                let mut buffer = vec![0u8; 4096];
+                let mut buffer = vec![0; 64 * 1024];
 
                 loop {
                     let size = match reader.read(&mut buffer).await {
@@ -372,16 +375,15 @@ where
                     let handler = handler.clone();
                     let state = state.clone();
                     let manager = manager.clone();
-                    tokio::spawn(async move {
-                        handler(packet, addr, state, manager).await;
-                    });
+                    handler(packet, addr, state, manager).await;
                 }
             }
         }
 
         manager.unregister(addr, state).await;
 
-        write_task.abort();
+        drop(tx);
+        let _ = write_task.await;
     }
 
     fn spawn_udp_listener(
@@ -399,20 +401,17 @@ where
                 }
             };
 
+            let mut buffer = vec![0u8; 65535];
             loop {
-                // Allocate buffer for max UDP packet size (65535 bytes)
-                let mut buffer = vec![0u8; 65535];
 
                 let (size, client_addr) = match socket.recv_from(&mut buffer).await {
                     Ok(res) => res,
                     Err(_) => continue,
                 };
 
-                // Shrink buffer to actual received size
-                buffer.truncate(size);
 
                 let packet = Packet {
-                    data: buffer,
+                    data: buffer[..size].to_vec(),
                     protocol: Protocol::Udp,
                     responder: Responder::Udp(socket.clone(), client_addr),
                 };
@@ -421,9 +420,7 @@ where
                 let state = state.clone();
                 let mg = manager.clone();
 
-                tokio::spawn(async move {
-                    handler(packet, client_addr, state, mg).await;
-                });
+                handler(packet, client_addr, state, mg).await;
             }
         });
     }
@@ -514,14 +511,13 @@ where
                         let state = state.clone();
                         let mg = manager.clone();
 
-                        tokio::spawn(async move {
-                            handler(packet, client_addr, state, mg).await;
-                        });
+                        handler(packet, client_addr, state, mg).await;
                     }
 
                     manager.unregister(client_addr, state).await;
 
-                    write_task.abort();
+                    drop(tx);
+                    let _ = write_task.await;
                 });
             }
         });
